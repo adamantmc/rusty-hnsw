@@ -236,6 +236,6 @@ fn main() {
         run_benchmark(CosineDistance {unit_vectors: false}, &args);
     }
     else if args.distance == "euclidean" {
-        run_benchmark(CosineDistance {unit_vectors: false}, &args);
+        run_benchmark(L2Distance {}, &args);
     }
 }
