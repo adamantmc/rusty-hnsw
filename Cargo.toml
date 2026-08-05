@@ -1,0 +1,11 @@
+[package]
+name = "hnsw"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = "0.4.45"
+clap = { version = "4.6.5", features = ["derive"] }
+kdam = "0.6.4"
+log = "0.4.33"
+rand = "0.9.5"
