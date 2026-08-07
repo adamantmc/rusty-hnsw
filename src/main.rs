@@ -5,7 +5,9 @@ use nn::knn::{BruteForceKNN, KNN};
 use nn::hnsw::graph::HNSWGraph;
 use metrics::{Metric, CosineDistance, L2Distance};
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::hash::Hash;
+use std::io::{self, BufReader, Read};
 use std::time::{Instant};
 use chrono::prelude::*;
 use log::{Record, Metadata, SetLoggerError, debug, LevelFilter, info};
@@ -35,6 +37,33 @@ static LOGGER: SimpleLogger = SimpleLogger;
 
 pub fn init_logging(level: LevelFilter) -> Result<(), SetLoggerError> {
     log::set_logger(&LOGGER).map(|()| log::set_max_level(level))
+}
+
+fn read_fvecs(path: &str) -> io::Result<Vec<Vec<f32>>> {
+    let mut r = BufReader::new(File::open(path)?);
+    let mut vecs = Vec::new();
+    let mut dim_buf = [0u8; 4];
+
+    loop {
+        // Read the count. A clean EOF here means we're done.
+        match r.read_exact(&mut dim_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+        let dim = u32::from_le_bytes(dim_buf) as usize;
+
+        // Read dim * 4 bytes, then reinterpret as f32s.
+        let mut bytes = vec![0u8; dim * 4];
+        r.read_exact(&mut bytes)?;  // a short read *here* is a truncated file, so it stays an error
+
+        let v: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        vecs.push(v);
+    }
+    Ok(vecs)
 }
 
 fn random_vectors(dims: usize, length: usize) -> Vec<Vec<f32>> {
@@ -98,7 +127,7 @@ fn calculate_recall(retrieved: &[&String], golden: &[&String], recall_levels: &V
 }
 
 
-fn benchmark<T: Metric>(vectors: Vec<Vec<f32>>, mut hnsw_graph: HNSWGraph<T>, mut brute_force_knn: BruteForceKNN<T>, ef_search: usize, recall_levels: &[usize]) -> (HashMap<usize, Vec<f64>>, Vec<f64>, Vec<f64>){
+fn benchmark<T: Metric>(vectors: Vec<Vec<f32>>, query_vectors: Option<Vec<Vec<f32>>>, mut hnsw_graph: HNSWGraph<T>, mut brute_force_knn: BruteForceKNN<T>, ef_search: usize, recall_levels: &[usize]) -> (HashMap<usize, Vec<f64>>, Vec<f64>, Vec<f64>){
     // HNSW insert
     let mut pb_hnsw_insert = tqdm!(total=vectors.len());
     for i in 0..vectors.len() {
@@ -117,9 +146,8 @@ fn benchmark<T: Metric>(vectors: Vec<Vec<f32>>, mut hnsw_graph: HNSWGraph<T>, mu
     }
     eprintln!();
 
-
-    let mut cloned_vectors = vectors.clone();
-    cloned_vectors.shuffle(&mut rand::rng());
+    let mut vectors_to_query = if query_vectors.is_none() {vectors.clone()} else {query_vectors.unwrap().clone()};
+    vectors_to_query.shuffle(&mut rand::rng());
 
     let mut sorted_recall_levels = Vec::from(recall_levels);
     sorted_recall_levels.sort();
@@ -133,11 +161,11 @@ fn benchmark<T: Metric>(vectors: Vec<Vec<f32>>, mut hnsw_graph: HNSWGraph<T>, mu
     }
 
     // HNSW search
-    let mut pb_hnsw_search = tqdm!(total=cloned_vectors.len());
+    let mut pb_hnsw_search = tqdm!(total=vectors_to_query.len());
     let mut hnsw_results: Vec<Vec<(&String, f32)>> = Vec::new();
     let mut hnsw_durations_per_query: Vec<f64> = Vec::new();
 
-    for x in cloned_vectors.iter().enumerate() {
+    for x in vectors_to_query.iter().enumerate() {
         pb_hnsw_search.set_description("HNSW search");
         let _ = pb_hnsw_search.update(1);
 
@@ -150,11 +178,11 @@ fn benchmark<T: Metric>(vectors: Vec<Vec<f32>>, mut hnsw_graph: HNSWGraph<T>, mu
     eprintln!();
 
     // KNN Search
-    let mut pb_knn_search = tqdm!(total=cloned_vectors.len());
+    let mut pb_knn_search = tqdm!(total=vectors_to_query.len());
     let mut knn_results: Vec<Vec<(&String, f32)>> = Vec::new();
     let mut knn_durations_per_query: Vec<f64> = Vec::new();
 
-    for x in cloned_vectors.iter().enumerate() {
+    for x in vectors_to_query.iter().enumerate() {
         pb_knn_search.set_description("KNN search");
         let _ = pb_knn_search.update(1);
 
@@ -185,25 +213,31 @@ fn benchmark<T: Metric>(vectors: Vec<Vec<f32>>, mut hnsw_graph: HNSWGraph<T>, mu
 #[derive(Parser, Debug)]
 #[command(version, about, long_about=None)]
 struct Args {
-    #[arg(short, long, default_value_t = 10000)]
+    #[arg(long, default_value_t = 10000)]
     no_vectors: usize,
 
-    #[arg(short, long, default_value_t = 1024)]
+    #[arg(long, default_value = None)]
+    index_vectors_path: Option<String>,
+
+    #[arg(long, default_value = None)]
+    query_vectors_path: Option<String>,
+
+    #[arg(long, default_value_t = 1024)]
     dimensions: usize,
 
-    #[arg(short, long, default_value_t = 512)]
+    #[arg(long, default_value_t = 512)]
     ef_search: usize,
 
-    #[arg(short, long, default_value_t = 512)]
+    #[arg(long, default_value_t = 512)]
     ef_construction: usize,
 
-    #[arg(short, long, default_value_t = 16)]
+    #[arg(long, default_value_t = 16)]
     m: usize,
 
-    #[arg(short, long, default_values_t = Vec::from([1, 5, 10, 20, 32]))]
+    #[arg(long, default_values_t = Vec::from([1, 5, 10, 20, 32]))]
     recall: Vec<usize>,
 
-    #[arg(short, long, default_value = "cosine", value_parser = ["cosine", "euclidean"])]
+    #[arg(long, default_value = "cosine", value_parser = ["cosine", "euclidean"])]
     distance: String,
 }
 
@@ -212,8 +246,28 @@ fn run_benchmark<M: Metric+Copy>(metric: M, args: &Args) {
     let knn: BruteForceKNN<M> = BruteForceKNN::new(metric);
     let hnsw: HNSWGraph<M> = HNSWGraph::new(metric, args.ef_construction, args.m);
 
-    let vectors = random_vectors(args.dimensions, args.no_vectors);
-    let results = benchmark(vectors, hnsw, knn, 128, &args.recall);
+    let mut vectors: Vec<Vec<f32>>;
+    let mut query_vectors: Option<Vec<Vec<f32>>> = Option::None;
+
+    if args.index_vectors_path.is_some() {
+        let path = args.index_vectors_path.clone().unwrap();
+        println!("Loading index vectors from {}", path);
+        vectors = read_fvecs(&path).unwrap();
+        println!("Loaded {} index vectors", vectors.len());
+    }
+    else {
+        vectors = random_vectors(args.dimensions, args.no_vectors);
+    }
+
+    if args.query_vectors_path.is_some() {
+        let path = args.query_vectors_path.clone().unwrap();
+        println!("Loading query vectors from {}", path);
+        let out = read_fvecs(&path).unwrap();
+        println!("Loaded {} query vectors", out.len());
+        query_vectors = Some(out);
+    }
+
+    let results = benchmark(vectors, query_vectors, hnsw, knn, 128, &args.recall);
 
     for recall_level in &args.recall {
         let recall_per_query = results.0.get(&recall_level).unwrap();
@@ -226,6 +280,7 @@ fn run_benchmark<M: Metric+Copy>(metric: M, args: &Args) {
 }
 
 fn main() {
+    let vecs = read_fvecs("/home/swagdam/Downloads/sift/sift_base.fvecs");
     let args = Args::parse();
 
     println!("{:?}", args);
