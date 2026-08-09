@@ -1,6 +1,7 @@
 mod metrics;
 mod nn;
 
+use std::cmp::min;
 use nn::knn::{BruteForceKNN, KNN};
 use nn::hnsw::graph::HNSWGraph;
 use metrics::{Metric, CosineDistance, L2Distance};
@@ -116,7 +117,7 @@ fn calculate_recall(retrieved: &[&String], golden: &[&String], recall_levels: &V
     let mut recall_values: Vec<f64> = Vec::new();
 
     for level in recall_levels {
-        let s1: HashSet<&String> = HashSet::from_iter(retrieved[0..*level].iter().map(|x| *x));
+        let s1: HashSet<&String> = HashSet::from_iter(retrieved[0..min(*level, retrieved.len())].iter().map(|x| *x));
         let s2: HashSet<&String> = HashSet::from_iter(golden[0..*level].iter().map(|x| *x));
 
         recall_values.push(recall(&s1, &s2));
@@ -267,7 +268,7 @@ fn run_benchmark<M: Metric+Copy>(metric: M, args: &Args) {
         query_vectors = Some(out);
     }
 
-    let results = benchmark(vectors, query_vectors, hnsw, knn, 128, &args.recall);
+    let results = benchmark(vectors, query_vectors, hnsw, knn, args.ef_search, &args.recall);
 
     for recall_level in &args.recall {
         let recall_per_query = results.0.get(&recall_level).unwrap();
@@ -280,7 +281,6 @@ fn run_benchmark<M: Metric+Copy>(metric: M, args: &Args) {
 }
 
 fn main() {
-    let vecs = read_fvecs("/home/swagdam/Downloads/sift/sift_base.fvecs");
     let args = Args::parse();
 
     println!("{:?}", args);
