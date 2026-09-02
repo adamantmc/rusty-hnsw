@@ -2,19 +2,23 @@ mod metrics;
 mod nn;
 
 use std::cmp::min;
-use nn::knn::{BruteForceKNN, KNN};
+use nn::knn::{KNN};
+use nn::NearestNeighbours;
 use nn::hnsw::graph::HNSWGraph;
 use metrics::{Metric, CosineDistance, L2Distance};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::hash::Hash;
 use std::io::{self, BufReader, Read};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Instant};
 use chrono::prelude::*;
-use log::{Record, Metadata, SetLoggerError, debug, LevelFilter, info};
+use log::{Record, Metadata, SetLoggerError, LevelFilter};
 use rand::seq::SliceRandom;
 use clap::Parser;
 use kdam::{tqdm, BarExt};
+use crate::nn::hnsw::graph::HNSWSearchParams;
 
 struct SimpleLogger;
 
@@ -128,13 +132,64 @@ fn calculate_recall(retrieved: &[&String], golden: &[&String], recall_levels: &V
 }
 
 
-fn benchmark<T: Metric>(vectors: Vec<Vec<f32>>, query_vectors: Option<Vec<Vec<f32>>>, mut hnsw_graph: HNSWGraph<T>, mut brute_force_knn: BruteForceKNN<T>, ef_search: usize, recall_levels: &[usize]) -> (HashMap<usize, Vec<f64>>, Vec<f64>, Vec<f64>){
+fn threaded_nn_search<'a, T: NearestNeighbours + Send + Sync>(
+    nn: &'a T,
+    vectors_to_query: &[(usize, &Vec<f32>)],
+    p: T::SearchParams,
+    k: usize,
+    no_search_threads: i32,
+    pb_prefix: &str
+) -> (Vec<(usize, Vec<(&'a String, f32)>)>, Vec<f64>) {
+    let thread_chunk_size = (vectors_to_query.len() as f32 / no_search_threads as f32).ceil() as usize;
+    let mut pb = tqdm!(total=vectors_to_query.len());
+    let mut results: Vec<(usize, Vec<(&String, f32)>)> = Vec::new();
+    let mut durations_per_query: Vec<f64> = Vec::new();
+
+    let (tx, rx) = mpsc::channel::<(usize, Vec<(&String, f32)>)/* Type */>();
+    let (dur_tx, dur_rx) = mpsc::channel::<f64>();
+
+    thread::scope(|sc| {
+        let mut vector_chunks = vectors_to_query.chunks(thread_chunk_size);
+
+        for _ in 0..no_search_threads {
+            let tx_clone = tx.clone();
+            let dur_tx_clone = dur_tx.clone();
+
+            let chunk = vector_chunks.next().unwrap();
+            sc.spawn(move || {
+                for x in chunk {
+                    let start = Instant::now();
+                    let query_results = nn.search(&x.1, k, p);
+                    tx_clone.send((x.0, query_results)).unwrap();
+                    dur_tx_clone.send(start.elapsed().as_secs_f64()).unwrap();
+                }
+                drop(tx_clone);
+                drop(dur_tx_clone);
+            });
+        }
+
+        drop(tx);
+        drop(dur_tx);
+
+        for (result, duration) in rx.iter().zip(dur_rx.iter()) {
+            pb.set_description(pb_prefix);
+            let _ = pb.update(1);
+            results.push(result);
+            durations_per_query.push(duration);
+        }
+    });
+
+    (results, durations_per_query)
+}
+
+
+fn benchmark<T: Metric + Send + Sync >(vectors: &[Vec<f32>], query_vectors: &[Vec<f32>], mut hnsw_graph: HNSWGraph<T>, mut brute_force_knn: KNN<T>, ef_search: usize, recall_levels: &[usize], no_search_threads: i32) -> (HashMap<usize, Vec<f64>>, Vec<f64>, Vec<f64>){
     // HNSW insert
     let mut pb_hnsw_insert = tqdm!(total=vectors.len());
     for i in 0..vectors.len() {
         pb_hnsw_insert.set_description("HNSW insertion");
         let _ =pb_hnsw_insert.update(1);
-        hnsw_graph.insert(String::from(i.to_string()), vectors[i].clone(), None);
+        hnsw_graph.insert(String::from(i.to_string()), vectors[i].clone());
     }
     eprintln!();
 
@@ -147,8 +202,7 @@ fn benchmark<T: Metric>(vectors: Vec<Vec<f32>>, query_vectors: Option<Vec<Vec<f3
     }
     eprintln!();
 
-    let mut vectors_to_query = if query_vectors.is_none() {vectors.clone()} else {query_vectors.unwrap().clone()};
-    vectors_to_query.shuffle(&mut rand::rng());
+    let vectors_to_query: Vec<(usize, &Vec<f32>)> = query_vectors.iter().enumerate().collect();
 
     let mut sorted_recall_levels = Vec::from(recall_levels);
     sorted_recall_levels.sort();
@@ -162,43 +216,39 @@ fn benchmark<T: Metric>(vectors: Vec<Vec<f32>>, query_vectors: Option<Vec<Vec<f3
     }
 
     // HNSW search
-    let mut pb_hnsw_search = tqdm!(total=vectors_to_query.len());
-    let mut hnsw_results: Vec<Vec<(&String, f32)>> = Vec::new();
-    let mut hnsw_durations_per_query: Vec<f64> = Vec::new();
-
-    for x in vectors_to_query.iter().enumerate() {
-        pb_hnsw_search.set_description("HNSW search");
-        let _ = pb_hnsw_search.update(1);
-
-        let start = Instant::now();
-        let query_hnsw_results = hnsw_graph.search(&x.1, ef_search, max_recall_level);
-        hnsw_durations_per_query.push(start.elapsed().as_secs_f64());
-        hnsw_results.push(query_hnsw_results);
-    }
+    let hnsw_out = threaded_nn_search(
+        &hnsw_graph,
+        &vectors_to_query,
+        HNSWSearchParams{ef_search: ef_search},
+        max_recall_level,
+        no_search_threads,
+        "HNSW Search"
+    );
+    let mut hnsw_results = hnsw_out.0;
+    let hnsw_durations_per_query: Vec<f64> = hnsw_out.1;
 
     eprintln!();
 
     // KNN Search
-    let mut pb_knn_search = tqdm!(total=vectors_to_query.len());
-    let mut knn_results: Vec<Vec<(&String, f32)>> = Vec::new();
-    let mut knn_durations_per_query: Vec<f64> = Vec::new();
-
-    for x in vectors_to_query.iter().enumerate() {
-        pb_knn_search.set_description("KNN search");
-        let _ = pb_knn_search.update(1);
-
-        let start = Instant::now();
-        let query_knn_results = brute_force_knn.search(&x.1, max_recall_level);
-        knn_durations_per_query.push(start.elapsed().as_secs_f64());
-        knn_results.push(query_knn_results);
-    }
-
+    let knn_out = threaded_nn_search(
+        &brute_force_knn,
+        &vectors_to_query,
+        (),
+        max_recall_level,
+        no_search_threads,
+        "KNN Search"
+    );
+    let mut knn_results = knn_out.0;
+    let knn_durations_per_query: Vec<f64> = knn_out.1;
     eprintln!();
 
-    for (hnsw_results, knn_results) in hnsw_results.iter().zip(knn_results) {
+    hnsw_results.sort_by(|a, b| a.0.cmp(&b.0));
+    knn_results.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (hnsw_result, knn_result) in hnsw_results.iter().zip(knn_results) {
         let recall = calculate_recall(
-            &hnsw_results.iter().map(|x| x.0).collect::<Vec<_>>(),
-            &knn_results.iter().map(|x| x.0).collect::<Vec<_>>(),
+            &hnsw_result.1.iter().map(|x| x.0).collect::<Vec<_>>(),
+            &knn_result.1.iter().map(|x| x.0).collect::<Vec<_>>(),
             &sorted_recall_levels
         );
 
@@ -214,6 +264,9 @@ fn benchmark<T: Metric>(vectors: Vec<Vec<f32>>, query_vectors: Option<Vec<Vec<f3
 #[derive(Parser, Debug)]
 #[command(version, about, long_about=None)]
 struct Args {
+    #[arg(long, default_value_t = 8)]
+    no_search_threads: i32,
+
     #[arg(long, default_value_t = 10000)]
     no_vectors: usize,
 
@@ -243,12 +296,12 @@ struct Args {
 }
 
 
-fn run_benchmark<M: Metric+Copy>(metric: M, args: &Args) {
-    let knn: BruteForceKNN<M> = BruteForceKNN::new(metric);
+fn run_benchmark<M: Metric + Copy + Send + Sync>(metric: M, args: &Args) {
+    let knn: KNN<M> = KNN::new(metric);
     let hnsw: HNSWGraph<M> = HNSWGraph::new(metric, args.ef_construction, args.m);
 
-    let mut vectors: Vec<Vec<f32>>;
-    let mut query_vectors: Option<Vec<Vec<f32>>> = Option::None;
+    let vectors: Vec<Vec<f32>>;
+    let mut query_vectors: Vec<Vec<f32>>;
 
     if args.index_vectors_path.is_some() {
         let path = args.index_vectors_path.clone().unwrap();
@@ -265,10 +318,14 @@ fn run_benchmark<M: Metric+Copy>(metric: M, args: &Args) {
         println!("Loading query vectors from {}", path);
         let out = read_fvecs(&path).unwrap();
         println!("Loaded {} query vectors", out.len());
-        query_vectors = Some(out);
+        query_vectors = out;
+    }
+    else {
+        query_vectors = vectors.clone();
+        query_vectors.shuffle(&mut rand::rng());
     }
 
-    let results = benchmark(vectors, query_vectors, hnsw, knn, args.ef_search, &args.recall);
+    let results = benchmark(&vectors, &query_vectors, hnsw, knn, args.ef_search, &args.recall, args.no_search_threads);
 
     for recall_level in &args.recall {
         let recall_per_query = results.0.get(&recall_level).unwrap();

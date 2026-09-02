@@ -1,21 +1,19 @@
 use std::cmp::min;
 use std::collections::HashMap;
 use crate::metrics::Metric;
+use crate::nn::NearestNeighbours;
 
-pub trait KNN {
-    fn insert(&mut self, id: String, vector: Vec<f32>);
-    fn search(&self, vector: &[f32], k: usize) -> Vec<(&String, f32)>;
-}
+pub struct KNN<M: Metric> {metric: M, id_map: HashMap<String, usize>, data: Vec<Vec<f32>>}
 
-pub struct BruteForceKNN<M: Metric> {metric: M, id_map: HashMap<String, usize>, data: Vec<Vec<f32>>}
-
-impl<M: Metric> BruteForceKNN<M> {
+impl<M: Metric> KNN<M> {
     pub fn new(metric: M) -> Self {
         Self {metric, id_map: HashMap::new(), data: Vec::new()}
     }
 }
 
-impl<M: Metric> KNN for BruteForceKNN<M> {
+impl<M: Metric> NearestNeighbours for KNN<M> {
+    type SearchParams = ();
+
     fn insert(&mut self, id: String, vector: Vec<f32>) {
         let entry = self.id_map.get(&id);
         let vec_id: usize = self.data.len();
@@ -32,7 +30,7 @@ impl<M: Metric> KNN for BruteForceKNN<M> {
 
     }
 
-    fn search(&self, vector: &[f32], k: usize) -> Vec<(&String, f32)> {
+    fn search(&self, vector: &[f32], k: usize, _: Self::SearchParams) -> Vec<(&String, f32)> {
         let mut reverse_id_map: HashMap<usize, &String> = HashMap::new();
 
         for pair in self.id_map.iter() {

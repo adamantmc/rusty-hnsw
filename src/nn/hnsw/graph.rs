@@ -3,6 +3,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use log::debug;
 use crate::metrics::Metric;
 use crate::nn::dist::Dist;
+use crate::nn::NearestNeighbours;
 
 fn non_zero_rand() -> f64 {
     let mut v: f64 = rand::random();
@@ -97,7 +98,17 @@ pub(crate) struct HNSWGraph<M: Metric> {
     ml: f64
 }
 
+#[derive(Copy, Clone)]
+pub struct HNSWSearchParams {
+    pub ef_search: usize
+}
+
+impl Default for HNSWSearchParams {
+    fn default() -> Self { HNSWSearchParams {ef_search: 32}}
+}
+
 impl<M: Metric> HNSWGraph<M> {
+
     pub fn new(metric: M, ef_construction: usize, m: usize) -> Self {
         HNSWGraph {
             metric,
@@ -115,11 +126,82 @@ impl<M: Metric> HNSWGraph<M> {
         }
     }
 
-    pub fn insert(&mut self, id: String, vector: Vec<f32>, landing_layer: Option<u8>) {
-        let l = match landing_layer {
-            Some(v) => {v},
-            None => {(-non_zero_rand().ln()*self.ml).floor() as u8}
-        };
+    fn search_layer(&self, q: &[f32], entry_points: &[usize], ef_search: usize, layer: u8) -> Vec<(f32, usize)> {
+        let mut visited: HashSet<usize> = HashSet::from_iter(entry_points.iter().map(|v| *v));
+
+        let ep_distances: Vec<(Dist, usize)> = visited.iter().map(
+            |a| (Dist(self.metric.distance(q, &self.vectors[*a])), *a)
+        ).collect();
+
+        // BinaryHeap is a max heap. We want to find the nearest element to Q from the candidate
+        // list, so we reverse this one
+        let mut candidates: BinaryHeap<Reverse<(Dist, usize)>> = BinaryHeap::from_iter(
+            ep_distances.iter().map(|a| Reverse(*a))
+        );
+
+        // We want to remove the farthest, so we keep it as a max heap, to get the element with the
+        // maximum distance to q
+        let mut results: BinaryHeap<(Dist, usize)> = BinaryHeap::from(ep_distances.clone());
+
+        while candidates.len() > 0 {
+            let candidate = candidates.pop().unwrap().0;
+            let mut farthest = results.peek().unwrap();
+
+            // Stopping condition - if the closest candidate is farther than the farthest result, stop
+            if candidate.0 > farthest.0 {
+                break
+            }
+            let candidate_neighbours_ref = self.nodes[candidate.1].neighbours(layer);
+            match candidate_neighbours_ref {
+                None => {}
+                Some(candidate_neighbours) => {
+                    debug!("Candidate {} has {} neighbours in layer {}", candidate.1, candidate_neighbours.len(), layer);
+                    for neighbour in candidate_neighbours {
+                        if visited.contains(&neighbour) {
+                            continue
+                        }
+
+                        visited.insert(*neighbour);
+
+                        // TODO: why twice?
+                        farthest = results.peek().unwrap();
+
+                        let distance = self.metric.distance(q, &self.vectors[*neighbour]);
+
+                        // If the neighbour is closer than the farthest result, add it to the candidates and results
+                        // Ignore distance if we have less than `ef_search` results
+                        if farthest.0.0 > distance || results.len() < ef_search {
+                            candidates.push(Reverse((Dist(distance), *neighbour)));
+                            results.push((Dist(distance), *neighbour));
+
+                            // If we have more than `ef_search` results, pop the farthest one
+                            if results.len() > ef_search {
+                                results.pop();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut out = Vec::from_iter(results.iter().cloned().map(|a| (a.0, a.1)));
+
+        out.sort();
+
+        out.iter().map(|a| (a.0.0, a.1)).collect()
+
+    }
+
+    fn select_neighbours_simple(&self, candidates: &[(f32, usize)], m: usize) -> Vec<(f32, usize)>{
+        candidates[0..min(m, candidates.len())].to_vec()
+    }
+}
+
+impl<M: Metric> NearestNeighbours for HNSWGraph<M> {
+    type SearchParams = HNSWSearchParams;
+
+     fn insert(&mut self, id: String, vector: Vec<f32>) {
+        let l = (-non_zero_rand().ln()*self.ml).floor() as u8;
 
         let node_id = self.nodes.len();
 
@@ -225,73 +307,7 @@ impl<M: Metric> HNSWGraph<M> {
         }
     }
 
-    fn search_layer(&self, q: &[f32], entry_points: &[usize], ef_search: usize, layer: u8) -> Vec<(f32, usize)> {
-        let mut visited: HashSet<usize> = HashSet::from_iter(entry_points.iter().map(|v| *v));
-
-        let ep_distances: Vec<(Dist, usize)> = visited.iter().map(
-            |a| (Dist(self.metric.distance(q, &self.vectors[*a])), *a)
-        ).collect();
-
-        // BinaryHeap is a max heap. We want to find the nearest element to Q from the candidate
-        // list, so we reverse this one
-        let mut candidates: BinaryHeap<Reverse<(Dist, usize)>> = BinaryHeap::from_iter(
-            ep_distances.iter().map(|a| Reverse(*a))
-        );
-
-        // We want to remove the farthest, so we keep it as a max heap, to get the element with the
-        // maximum distance to q
-        let mut results: BinaryHeap<(Dist, usize)> = BinaryHeap::from(ep_distances.clone());
-
-        while candidates.len() > 0 {
-            let candidate = candidates.pop().unwrap().0;
-            let mut farthest = results.peek().unwrap();
-
-            // Stopping condition - if the closest candidate is farther than the farthest result, stop
-            if candidate.0 > farthest.0 {
-                break
-            }
-            let candidate_neighbours_ref = self.nodes[candidate.1].neighbours(layer);
-            match candidate_neighbours_ref {
-                None => {}
-                Some(candidate_neighbours) => {
-                    debug!("Candidate {} has {} neighbours in layer {}", candidate.1, candidate_neighbours.len(), layer);
-                    for neighbour in candidate_neighbours {
-                        if visited.contains(&neighbour) {
-                            continue
-                        }
-
-                        visited.insert(*neighbour);
-
-                        // TODO: why twice?
-                        farthest = results.peek().unwrap();
-
-                        let distance = self.metric.distance(q, &self.vectors[*neighbour]);
-
-                        // If the neighbour is closer than the farthest result, add it to the candidates and results
-                        // Ignore distance if we have less than `ef_search` results
-                        if farthest.0.0 > distance || results.len() < ef_search {
-                            candidates.push(Reverse((Dist(distance), *neighbour)));
-                            results.push((Dist(distance), *neighbour));
-
-                            // If we have more than `ef_search` results, pop the farthest one
-                            if results.len() > ef_search {
-                                results.pop();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut out = Vec::from_iter(results.iter().cloned().map(|a| (a.0, a.1)));
-
-        out.sort();
-
-        out.iter().map(|a| (a.0.0, a.1)).collect()
-
-    }
-
-    pub fn search(&self, q: &[f32], ef_search: usize, k: usize) -> Vec<(&String, f32)> {
+    fn search(&self, q: &[f32], k: usize, p: Self::SearchParams) -> Vec<(&String, f32)> {
         let top_layer = self.layers - 1;
         let mut entry_point: usize;
 
@@ -307,12 +323,11 @@ impl<M: Metric> HNSWGraph<M> {
 
         debug!("Search on layer 0 with entry point {}", entry_point);
 
-        let out = self.search_layer(&q, &[entry_point], ef_search, 0);
+        let out = self.search_layer(&q, &[entry_point], p.ef_search, 0);
 
         out.iter().take(k).map(|item| (self.reverse_id_map.get(&item.1).unwrap(), item.0)).collect()
     }
 
-    fn select_neighbours_simple(&self, candidates: &[(f32, usize)], m: usize) -> Vec<(f32, usize)>{
-        candidates[0..min(m, candidates.len())].to_vec()
-    }
+
+
 }
