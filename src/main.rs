@@ -18,7 +18,7 @@ use log::{Record, Metadata, SetLoggerError, LevelFilter};
 use rand::seq::SliceRandom;
 use clap::Parser;
 use kdam::{tqdm, BarExt};
-use crate::nn::hnsw::graph::HNSWSearchParams;
+use crate::nn::hnsw::graph::{HNSWSearchParams};
 
 struct SimpleLogger;
 
@@ -293,13 +293,16 @@ struct Args {
 
     #[arg(long, default_value = "cosine", value_parser = ["cosine", "euclidean"])]
     distance: String,
+
+    #[arg(long, default_value = "heuristic", value_parser = ["heuristic", "simple"])]
+    hnsw_neighbours_algorithm: String,
+
+    #[arg(action = clap::ArgAction::SetFalse, default_value_t = true)]
+    hnsw_neighbours_heuristic_extend_candidates: bool
 }
 
 
 fn run_benchmark<M: Metric + Copy + Send + Sync>(metric: M, args: &Args) {
-    let knn: KNN<M> = KNN::new(metric);
-    let hnsw: HNSWGraph<M> = HNSWGraph::new(metric, args.ef_construction, args.m);
-
     let vectors: Vec<Vec<f32>>;
     let mut query_vectors: Vec<Vec<f32>>;
 
@@ -324,6 +327,16 @@ fn run_benchmark<M: Metric + Copy + Send + Sync>(metric: M, args: &Args) {
         query_vectors = vectors.clone();
         query_vectors.shuffle(&mut rand::rng());
     }
+
+    let knn: KNN<M> = KNN::new(metric);
+    let hnsw: HNSWGraph<M> = HNSWGraph::new(
+        metric,
+        vectors[0].len(),
+        args.ef_construction,
+        args.m,
+        args.hnsw_neighbours_algorithm == "heuristic",
+        args.hnsw_neighbours_heuristic_extend_candidates
+    );
 
     let results = benchmark(&vectors, &query_vectors, hnsw, knn, args.ef_search, &args.recall, args.no_search_threads);
 

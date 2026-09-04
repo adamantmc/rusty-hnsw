@@ -1,9 +1,10 @@
 use std::cmp::{min, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::ops::Range;
 use log::debug;
 use crate::metrics::Metric;
 use crate::nn::dist::Dist;
-use crate::nn::NearestNeighbours;
+use crate::nn::{NearestNeighbours};
 
 fn non_zero_rand() -> f64 {
     let mut v: f64 = rand::random();
@@ -85,9 +86,10 @@ impl Edges {
 #[derive(Debug)]
 pub(crate) struct HNSWGraph<M: Metric> {
     metric: M,
+    dimensions: usize,
     id_map: HashMap<String, usize>,
     reverse_id_map: HashMap<usize, String>,
-    vectors: Vec<Vec<f32>>,
+    vectors: Vec<f32>,
     nodes: Vec<Node>,
     layers: u8,
     entry_point: Option<usize>,
@@ -95,7 +97,9 @@ pub(crate) struct HNSWGraph<M: Metric> {
     ef_construction: usize,
     m_max_0: usize,
     m_max: usize,
-    ml: f64
+    ml: f64,
+    neighbour_selector_heuristic: bool,
+    neighbour_selector_heuristic_extend_candidates: bool
 }
 
 #[derive(Copy, Clone)]
@@ -109,9 +113,10 @@ impl Default for HNSWSearchParams {
 
 impl<M: Metric> HNSWGraph<M> {
 
-    pub fn new(metric: M, ef_construction: usize, m: usize) -> Self {
+    pub fn new(metric: M, dimensions: usize, ef_construction: usize, m: usize, use_neighbour_heuristic: bool, neighbour_heuristic_extend_candidates: bool) -> Self {
         HNSWGraph {
             metric,
+            dimensions,
             id_map: HashMap::new(),
             reverse_id_map: HashMap::new(),
             vectors: Vec::new(),
@@ -123,14 +128,22 @@ impl<M: Metric> HNSWGraph<M> {
             m_max_0: 2*m,
             m_max: m,
             ml: 1.0/(m as f64).ln(),
+            neighbour_selector_heuristic: use_neighbour_heuristic,
+            neighbour_selector_heuristic_extend_candidates: neighbour_heuristic_extend_candidates
         }
+    }
+
+    fn get_vector_range(&self, idx: usize) -> Range<usize> {
+        let start = self.dimensions * idx;
+        let end = start + self.dimensions;
+        Range { start, end }
     }
 
     fn search_layer(&self, q: &[f32], entry_points: &[usize], ef_search: usize, layer: u8) -> Vec<(f32, usize)> {
         let mut visited: HashSet<usize> = HashSet::from_iter(entry_points.iter().map(|v| *v));
 
         let ep_distances: Vec<(Dist, usize)> = visited.iter().map(
-            |a| (Dist(self.metric.distance(q, &self.vectors[*a])), *a)
+            |a| (Dist(self.metric.distance(q, &self.vectors[self.get_vector_range(*a)])), *a)
         ).collect();
 
         // BinaryHeap is a max heap. We want to find the nearest element to Q from the candidate
@@ -166,7 +179,7 @@ impl<M: Metric> HNSWGraph<M> {
                         // TODO: why twice?
                         farthest = results.peek().unwrap();
 
-                        let distance = self.metric.distance(q, &self.vectors[*neighbour]);
+                        let distance = self.metric.distance(q, &self.vectors[self.get_vector_range(*neighbour)]);
 
                         // If the neighbour is closer than the farthest result, add it to the candidates and results
                         // Ignore distance if we have less than `ef_search` results
@@ -192,8 +205,77 @@ impl<M: Metric> HNSWGraph<M> {
 
     }
 
-    fn select_neighbours_simple(&self, candidates: &[(f32, usize)], m: usize) -> Vec<(f32, usize)>{
+    fn select_neighbours_simple(&self, candidates: &[(f32, usize)], m: usize) -> Vec<(f32, usize)> {
         candidates[0..min(m, candidates.len())].to_vec()
+    }
+
+    fn select_neighbours_heuristic(&self, q: &[f32], candidates: &[(f32, usize)], m: usize, layer: u8, extend_candidates: bool, keep_pruned_connections: bool) -> Vec<(f32, usize)> {
+        let mut results: BinaryHeap<(Dist, usize)> = BinaryHeap::new();
+
+        let mut working_queue_node_ids: HashSet<usize> = HashSet::from_iter(candidates.iter().map(|a| a.1));
+
+        let mut working_queue: BinaryHeap<Reverse<(Dist, usize)>> = BinaryHeap::from_iter(
+            candidates.iter().map(|a| Reverse((Dist(a.0), a.1)))
+        );
+
+        if extend_candidates {
+            for c in candidates {
+                let neighbours = self.nodes[c.1].neighbours(layer).unwrap();
+                for neighbour in neighbours {
+                    if !working_queue_node_ids.contains(neighbour) {
+                        working_queue_node_ids.insert(*neighbour);
+                        working_queue.push(
+                            Reverse(
+                                (
+                                    Dist(
+                                        self.metric.distance(
+                                            q,
+                                            &self.vectors[self.get_vector_range(*neighbour)]
+                                        )
+                                    ),
+                                    *neighbour
+                                )
+                            )
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut discarded_bh: BinaryHeap<Reverse<(Dist, usize)>> = BinaryHeap::new();
+
+        while working_queue.len() != 0 && results.len() < m {
+            // Get nearest-to-q element from W
+            let e = working_queue.pop().unwrap();
+
+            // If e is closer to q than it is to any other result r, add to results
+            let is_closer_than_all = results.iter().all(|(_, r_id)| {
+                let d_e_r = self.metric.distance(
+                    &self.vectors[self.get_vector_range(e.0.1)],
+                    &self.vectors[self.get_vector_range(*r_id)]
+                );
+                e.0.0 < Dist(d_e_r)
+            });
+
+            if is_closer_than_all {
+                results.push((e.0.0, e.0.1));
+            }
+            else {
+                discarded_bh.push(e);
+            }
+        }
+
+        if keep_pruned_connections {
+            while discarded_bh.len() > 0 && results.len() < m {
+                results.push(discarded_bh.pop().unwrap().0);
+            }
+        }
+
+        let mut out = Vec::from_iter(results.iter().cloned().map(|a| (a.0, a.1)));
+
+        out.sort();
+
+        out.iter().map(|a| (a.0.0, a.1)).collect()
     }
 }
 
@@ -224,20 +306,16 @@ impl<M: Metric> NearestNeighbours for HNSWGraph<M> {
         let node = Node::new(l);
 
         self.nodes.push(node);
-        self.vectors.push(vector);
-
+        self.vectors.extend(vector);
 
         // Descend from top layer to just above the one we landed at, getting a single result
         // ("greedy search") and keeping it as the entrypoint for each next layer
         for layer in (l + 1..=top_layer).rev() {
-
             let search_results = self.search_layer(
-                &self.vectors.last().unwrap(), &entry_points, 1, layer
+                &self.vectors[self.get_vector_range(node_id)], &entry_points, 1, layer
             );
 
-
             entry_points = Vec::from([(*search_results.first().unwrap()).1]);
-
         }
 
         // Descend from landing layer to 0, starting at the entrypoint of the previous layer
@@ -249,10 +327,21 @@ impl<M: Metric> NearestNeighbours for HNSWGraph<M> {
 
             // Search for `ef_construction` closest vectors, using the entrypoints found previously
             let search_results = self.search_layer(
-                &self.vectors.last().unwrap(), &entry_points, self.ef_construction, layer
+                &self.vectors[self.get_vector_range(node_id)], &entry_points, self.ef_construction, layer
             );
 
-            let neighbours = self.select_neighbours_simple(&search_results, self.m);
+            let neighbours = if self.neighbour_selector_heuristic {
+                self.select_neighbours_heuristic(
+                    &self.vectors[self.get_vector_range(node_id)],
+                    &search_results,
+                    self.m,
+                    layer,
+                    self.neighbour_selector_heuristic_extend_candidates,
+                    true
+                )
+            } else {
+                self.select_neighbours_simple(&search_results, self.m)
+            };
 
             // Add bi-directional edges for closest vectors
             for tuple in &neighbours {
@@ -282,7 +371,19 @@ impl<M: Metric> NearestNeighbours for HNSWGraph<M> {
 
                             e_conn_tuples.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-                            let new_e_conn = self.select_neighbours_simple(&e_conn_tuples, m_max);
+                            let new_e_conn = if self.neighbour_selector_heuristic {
+                                self.select_neighbours_heuristic(
+                                    &self.vectors[self.get_vector_range(tuple.1)],
+                                    &e_conn_tuples,
+                                    m_max,
+                                    layer, 
+                                    false,
+                                    true
+                                )
+                            }
+                            else {
+                                self.select_neighbours_simple(&e_conn_tuples, m_max)
+                            };
 
                             let s_old: HashSet<usize> = e_conn.into_iter().map(|v| *v).collect();
                             let s_new: HashSet<usize> = HashSet::from_iter(new_e_conn.iter().map(|tup| tup.1));
