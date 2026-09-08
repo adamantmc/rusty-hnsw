@@ -18,6 +18,7 @@ use log::{Record, Metadata, SetLoggerError, LevelFilter};
 use rand::seq::SliceRandom;
 use clap::Parser;
 use kdam::{tqdm, BarExt};
+use crate::metrics::normalize_vector;
 use crate::nn::hnsw::graph::{HNSWSearchParams};
 
 struct SimpleLogger;
@@ -303,7 +304,7 @@ struct Args {
 
 
 fn run_benchmark<M: Metric + Copy + Send + Sync>(metric: M, args: &Args) {
-    let vectors: Vec<Vec<f32>>;
+    let mut vectors: Vec<Vec<f32>>;
     let mut query_vectors: Vec<Vec<f32>>;
 
     if args.index_vectors_path.is_some() {
@@ -326,6 +327,14 @@ fn run_benchmark<M: Metric + Copy + Send + Sync>(metric: M, args: &Args) {
     else {
         query_vectors = vectors.clone();
         query_vectors.shuffle(&mut rand::rng());
+    }
+
+    for i in 0..vectors.len() {
+        vectors[i] = normalize_vector(&vectors[i]);
+    }
+
+    for i in 0..query_vectors.len() {
+        query_vectors[i] = normalize_vector(&query_vectors[i]);
     }
 
     let knn: KNN<M> = KNN::new(metric);
@@ -358,7 +367,7 @@ fn main() {
     let _ = init_logging(LevelFilter::Info);
 
     if args.distance == "cosine" {
-        run_benchmark(CosineDistance {unit_vectors: false}, &args);
+        run_benchmark(CosineDistance {unit_vectors: true}, &args);
     }
     else if args.distance == "euclidean" {
         run_benchmark(L2Distance {}, &args);

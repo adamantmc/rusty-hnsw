@@ -1,4 +1,6 @@
-fn magnitude(v: &[f32]) -> f32 {
+use crate::metrics::simd::l2_squared_avx2;
+
+pub fn magnitude(v: &[f32]) -> f32 {
     let mut m: f32 = 0.0;
 
     for v in v.iter() {
@@ -11,8 +13,8 @@ fn magnitude(v: &[f32]) -> f32 {
 fn dot_product(v1: &[f32], v2: &[f32]) -> f32 {
     let mut dp: f32 = 0.0;
 
-    for (a, b) in v1.iter().zip(v2.iter()) {
-        dp += a * b
+    for i in 0..v1.len() {
+        dp += v1[i] * v2[i];
     }
 
     dp
@@ -32,12 +34,27 @@ pub fn cosine_similarity(v1: &[f32], v2: &[f32], unit_vectors: bool) -> f32 {
     (cos_sim + 1.0) / 2.0
 }
 
-pub fn l2_distance(v1: &[f32], v2: &[f32]) -> f32 {
+pub fn l2_squared_scalar(v1: &[f32], v2: &[f32]) -> f32 {
     let mut sum: f32 = 0.0;
 
     for (a,b) in v1.iter().zip(v2.iter()) {
         sum += (a - b).powi(2)
     }
 
-    sum.sqrt()
+    sum
+}
+
+
+pub fn l2_distance(v1: &[f32], v2: &[f32]) -> f32 {
+    let l2_squared_v: f32;
+
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        unsafe {
+            l2_squared_v = l2_squared_avx2(v1, v2);
+        }
+    } else {
+        l2_squared_v = l2_squared_scalar(v1, v2);
+    }
+
+    l2_squared_v.sqrt()
 }
