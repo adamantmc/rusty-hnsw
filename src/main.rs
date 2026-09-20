@@ -298,7 +298,7 @@ struct Args {
     #[arg(long, default_value = "heuristic", value_parser = ["heuristic", "simple"])]
     hnsw_neighbours_algorithm: String,
 
-    #[arg(action = clap::ArgAction::SetFalse, default_value_t = true)]
+    #[arg(long, action = clap::ArgAction::SetTrue, default_value_t = false)]
     hnsw_neighbours_heuristic_extend_candidates: bool
 }
 

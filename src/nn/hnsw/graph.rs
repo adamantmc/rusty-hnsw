@@ -337,7 +337,7 @@ impl<M: Metric> NearestNeighbours for HNSWGraph<M> {
                     self.m,
                     layer,
                     self.neighbour_selector_heuristic_extend_candidates,
-                    true
+                    false
                 )
             } else {
                 self.select_neighbours_simple(&search_results, self.m)
@@ -378,7 +378,7 @@ impl<M: Metric> NearestNeighbours for HNSWGraph<M> {
                                     m_max,
                                     layer, 
                                     false,
-                                    true
+                                    false
                                 )
                             }
                             else {
@@ -392,7 +392,7 @@ impl<M: Metric> NearestNeighbours for HNSWGraph<M> {
 
                             for v in diff {
                                 self.nodes[tuple.1].remove_edge(*v, layer);
-                                self.nodes[*v].remove_edge(tuple.1, layer);
+                                // self.nodes[*v].remove_edge(tuple.1, layer);
                             }
                         }
                     }

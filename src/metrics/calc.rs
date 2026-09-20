@@ -1,4 +1,4 @@
-use crate::metrics::simd::l2_squared_avx2;
+use crate::metrics::simd::{l2_distance_chunked_16_lanes_avx2, l2_distance_chunked_16_lanes};
 
 pub fn magnitude(v: &[f32]) -> f32 {
     let mut m: f32 = 0.0;
@@ -46,15 +46,15 @@ pub fn l2_squared_scalar(v1: &[f32], v2: &[f32]) -> f32 {
 
 
 pub fn l2_distance(v1: &[f32], v2: &[f32]) -> f32 {
-    let l2_squared_v: f32;
+    let l2_distance_v: f32;
 
     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
         unsafe {
-            l2_squared_v = l2_squared_avx2(v1, v2);
+            l2_distance_v = l2_distance_chunked_16_lanes_avx2(v1, v2);
         }
     } else {
-        l2_squared_v = l2_squared_scalar(v1, v2);
+        l2_distance_v = l2_distance_chunked_16_lanes(v1, v2);
     }
 
-    l2_squared_v.sqrt()
+    l2_distance_v
 }
